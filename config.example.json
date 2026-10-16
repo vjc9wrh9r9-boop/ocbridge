@@ -1,0 +1,21 @@
+{
+  "port": 8899,
+  "host": "127.0.0.1",
+  "api_key": "ocbridge-2026",
+  "backend": {
+    "port": 4999,
+    "password": "ocbridge-2026",
+    "cli_path": "",
+    "idle_timeout": 300,
+    "start_timeout": 45
+  },
+  "agent": "plan",
+  "request_timeout": 300,
+  "session_cache_size": 100,
+  "tool_envelope": true,
+  "probe": {
+    "timeout": 20,
+    "cache_ttl": 21600
+  },
+  "workbuddy_models": "~/.workbuddy/models.json"
+}
