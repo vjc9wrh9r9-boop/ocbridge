@@ -87,11 +87,11 @@ DEFAULT_CONFIG = {
         "port": 4999,
         "password": "ocbridge-2026",
         "cli_path": "",
-        "idle_timeout": 300,
+        "idle_timeout": 900,
         "start_timeout": 45,
     },
     "agent": "plan",
-    "request_timeout": 300,
+    "request_timeout": 180,
     "session_cache_size": 100,
     "tool_envelope": True,
     "probe": {"timeout": 20, "cache_ttl": 21600},
@@ -303,20 +303,43 @@ class BackendManager:
                     f"端口 {self.port} 已被其他程序占用且无法用配置密码连接。"
                     f"请修改 config.json 的 backend.port"
                 )
-            # 3) 拉起
+            # 3) 拉起 (失败自动重试一次: 兼容端口未完全释放等瞬时状况)
             self._starting = True
             try:
-                self._spawn()
-                deadline = time.time() + self.start_timeout
-                while time.time() < deadline:
-                    if self._proc and self._proc.poll() is not None:
-                        raise BackendError(f"opencode server 启动失败(退出码 {self._proc.returncode}), 见 {SERVE_LOG.name}")
-                    if self.health():
-                        self._ready = True
-                        log(f"opencode server 已就绪 (127.0.0.1:{self.port}, pid={self._proc.pid if self._proc else '?'})")
-                        return
-                    time.sleep(1)
-                raise BackendError("opencode server 启动超时")
+                last_err = None
+                for attempt in (1, 2):
+                    if attempt == 2:
+                        time.sleep(2)
+                        if self.health():          # 竞态: 其它实例已拉起
+                            self._ready = True
+                            self._proc = None
+                            log(f"复用已有 opencode server (127.0.0.1:{self.port})")
+                            return
+                    try:
+                        self._spawn()
+                        deadline = time.time() + self.start_timeout
+                        while time.time() < deadline:
+                            if self._proc and self._proc.poll() is not None:
+                                raise BackendError(f"opencode server 启动失败(退出码 {self._proc.returncode}), 见 {SERVE_LOG.name}")
+                            if self.health():
+                                self._ready = True
+                                log(f"opencode server 已就绪 (127.0.0.1:{self.port}, pid={self._proc.pid if self._proc else '?'})")
+                                return
+                            time.sleep(1)
+                        raise BackendError("opencode server 启动超时")
+                    except BackendError as e:
+                        last_err = e
+                        try:
+                            if self._proc and self._proc.poll() is None:
+                                self._proc.terminate()
+                        except Exception:
+                            pass
+                        self._proc = None
+                        if attempt == 2:
+                            raise
+                        log(f"opencode server 拉起失败({str(e)[:120]}), 2 秒后重试...")
+                if last_err:
+                    raise last_err
             finally:
                 self._starting = False
 
@@ -374,6 +397,12 @@ class BackendManager:
                     proc.kill()
             except Exception:
                 pass
+        if proc is not None:
+            # 等端口真正释放, 避免下一次拉起撞上尚未关闭的监听
+            for _ in range(30):
+                if not self._port_in_use():
+                    break
+                time.sleep(0.2)
 
     def shutdown(self):
         self._janitor_stop.set()
@@ -382,13 +411,12 @@ class BackendManager:
     def _janitor_loop(self):
         while not self._janitor_stop.wait(10):
             try:
-                if not self._ready:
-                    continue
-                if self._inflight > 0:
-                    continue
-                if self._proc is None:
-                    continue      # 外部实例不归我们管
-                if time.time() - self._last_active >= self.idle_timeout:
+                with self._lock:
+                    idle_stop = (
+                        self._ready and self._inflight == 0 and self._proc is not None
+                        and time.time() - self._last_active >= self.idle_timeout
+                    )
+                if idle_stop:
                     self.stop(reason=f"空闲超时({self.idle_timeout}s), 自动退出省内存")
             except Exception:
                 pass
@@ -993,8 +1021,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.handle_chat(body)
         except BackendError as e:
+            log(f"chat 失败(502): {e}")
             self._err(502, str(e), err_type="upstream_error")
         except Exception as e:
+            log(f"chat 内部错误(500): {type(e).__name__}: {e}")
             self._err(500, f"桥内部错误: {e}", err_type="server_error")
 
     # ---------- 核心 ----------
@@ -1026,41 +1056,60 @@ class Handler(BaseHTTPRequestHandler):
             self._err(503, f"OpenCode 未登录, 免费模型不可用。{login_msg}", err_type="login_required")
             return
 
-        backend.ensure()
+        backend.inc_inflight()          # 先标记在途, 防止与空闲自退竞态
         backend.touch()
-
-        prefix_key = SessionCache.key(messages[:-1]) if len(messages) > 1 else None
-        sid = cache.get(prefix_key)
-        incremental = sid is not None
-        t0 = time.time()
-        backend.inc_inflight()
-        if sid is not None:
-            busy.add(sid)
+        sid = None
         try:
-            if sid is None:
-                sid = backend.create_session(oc_model, title="bridge")
-                busy.add(sid)
-                prompt = build_prompt(messages, tools, cfg.get("tool_envelope", True))
-            else:
-                prompt = build_incremental(messages)
-            since_ms = int(time.time() * 1000) - 1500
-            try:
-                backend.send_prompt(sid, prompt)
-                text, meta = backend.wait_reply(sid, since_ms)
-            except Exception:
-                if incremental:
-                    # 增量失败 -> 全量重试一次
-                    cache.put(prefix_key, None)
-                    busy.discard(sid)
-                    sid = backend.create_session(oc_model, title="bridge")
+            backend.ensure()
+
+            t0 = time.time()
+            for _attempt in (1, 2):
+                prefix_key = SessionCache.key(messages[:-1]) if (len(messages) > 1 and _attempt == 1) else None
+                sid = cache.get(prefix_key) if prefix_key else None
+                incremental = sid is not None
+                if sid is not None:
                     busy.add(sid)
-                    prompt = build_prompt(messages, tools, cfg.get("tool_envelope", True))
+                try:
+                    if sid is None:
+                        sid = backend.create_session(oc_model, title="bridge")
+                        busy.add(sid)
+                        prompt = build_prompt(messages, tools, cfg.get("tool_envelope", True))
+                    else:
+                        prompt = build_incremental(messages)
                     since_ms = int(time.time() * 1000) - 1500
-                    backend.send_prompt(sid, prompt)
-                    text, meta = backend.wait_reply(sid, since_ms)
-                else:
-                    raise
-            cache.put(SessionCache.key(messages), sid)
+                    try:
+                        backend.send_prompt(sid, prompt)
+                        text, meta = backend.wait_reply(sid, since_ms)
+                    except Exception:
+                        if incremental:
+                            # 增量失败 -> 全量重试一次
+                            cache.put(prefix_key, None)
+                            busy.discard(sid)
+                            sid = backend.create_session(oc_model, title="bridge")
+                            busy.add(sid)
+                            prompt = build_prompt(messages, tools, cfg.get("tool_envelope", True))
+                            since_ms = int(time.time() * 1000) - 1500
+                            backend.send_prompt(sid, prompt)
+                            text, meta = backend.wait_reply(sid, since_ms)
+                        else:
+                            raise
+                    cache.put(SessionCache.key(messages), sid)
+                    break
+                except Exception as e:
+                    try:
+                        busy.discard(sid)
+                    except Exception:
+                        pass
+                    if _attempt == 2:
+                        raise
+                    # 后端可能处于"退出中/半死"状态: 清理重建, 重试一次
+                    log(f"chat 首次尝试失败({type(e).__name__}: {str(e)[:140]}), 重建后端并重试...")
+                    try:
+                        backend.stop(reason="失败重试前清理")
+                    except Exception:
+                        pass
+                    backend.touch()
+                    backend.ensure()
 
             # 信封解析 (仅当请求携带工具)
             content, tool_calls = text, []
@@ -1099,7 +1148,11 @@ class Handler(BaseHTTPRequestHandler):
                     "usage": usage,
                 })
         finally:
-            busy.discard(sid)
+            try:
+                if sid is not None:
+                    busy.discard(sid)
+            except Exception:
+                pass
             backend.dec_inflight()
 
     def _stream(self, cid, created, model, text, tool_calls):
