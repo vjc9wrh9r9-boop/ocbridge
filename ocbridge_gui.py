@@ -48,12 +48,7 @@ def _is_frozen():
 
 
 def cli_exe():
-    """定位命令行版 exe: 优先 tools\\ 子目录, 其次同目录。"""
-    if _is_frozen():
-        base = Path(sys.executable).parent
-        for c in (base / "tools" / "OCBridge-CLI.exe", base / "OCBridge-CLI.exe"):
-            if c.exists():
-                return str(c)
+    """命令行功能由本程序自身承载 (带参数运行)。"""
     return sys.executable
 
 
@@ -317,11 +312,17 @@ class BridgeGUI:
         else:
             self.lb_login.configure(text=f"登录状态: ✗ {login_msg}", foreground="#b03030")
 
-        cli = bridge.find_opencode_cli(CFG)
+        cli = bridge.find_opencode_cli(CFG, allow_extract=False)
+        has_xz = (bridge.APP_DIR / "opencode" / "opencode.exe.xz").exists()
         if cli:
             self.lb_cli.configure(text=f"opencode: ✓ {cli}", foreground="#0a7d32")
             if self.btn_dl.winfo_manager():
                 self.btn_dl.pack_forget()          # 引擎正常时隐藏急救按钮
+        elif has_xz:
+            self.lb_cli.configure(text="opencode: ✓ 内置引擎 (压缩存放, 首次启动服务时自动解压一次)",
+                                  foreground="#0a7d32")
+            if self.btn_dl.winfo_manager():
+                self.btn_dl.pack_forget()
         else:
             self.lb_cli.configure(
                 text="opencode: ✗ 未找到 — 点右侧 [⬇ 下载引擎] 自动修复",
@@ -383,16 +384,24 @@ class BridgeGUI:
         if not bridge.check_login()[0]:
             self.log("警告: opencode 未登录 — 请先在 OpenCode 客户端登录")
             self.show_window()
-        if not bridge.find_opencode_cli(CFG):
-            self.log("未找到 opencode, 请先点 [⬇ 下载 opencode] 或安装 OpenCode 客户端")
+        has_engine = bool(bridge.find_opencode_cli(CFG, allow_extract=False)) or \
+            (bridge.APP_DIR / "opencode" / "opencode.exe.xz").exists()
+        if not has_engine:
+            self.log("找不到 opencode 引擎, 请先点 [⬇ 下载引擎] 或安装 OpenCode 客户端")
             self.show_window()
             return
         logf = open(APP_DIR / "opencode_serve.log", "ab")
         try:
+            xz = bridge.APP_DIR / "opencode" / "opencode.exe.xz"
+            exe = bridge.APP_DIR / "opencode" / "opencode.exe"
+            first_time = xz.exists() and not exe.exists()
             self.svc_proc = subprocess.Popen(
                 service_args(), stdout=logf, stderr=subprocess.STDOUT,
                 cwd=str(APP_DIR), creationflags=no_window_flags())
-            self.log(f"服务已启动 (pid={self.svc_proc.pid}), 等待就绪...")
+            if first_time:
+                self.log(f"服务已启动 (pid={self.svc_proc.pid}) — 首次使用正在解压内置引擎, 约 10-20 秒后可用...")
+            else:
+                self.log(f"服务已启动 (pid={self.svc_proc.pid}), 等待就绪...")
             self.root.after(2500, self.refresh)
         except Exception as e:
             self.log(f"启动失败: {e}")
