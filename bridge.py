@@ -75,7 +75,7 @@ CACHE_PATH = APP_DIR / "models_cache.json"
 PROBE_CACHE_PATH = APP_DIR / "probe_cache.json"
 SERVE_LOG = APP_DIR / "opencode_serve.log"
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 OWNER = "ocbridge-v2"
 OWNER_FIELD = "ocBridgeOwner"
 
@@ -90,7 +90,7 @@ DEFAULT_CONFIG = {
         "idle_timeout": 900,
         "start_timeout": 45,
     },
-    "agent": "plan",
+    "agent": "bridge",
     "request_timeout": 180,
     "session_cache_size": 100,
     "tool_envelope": True,
@@ -220,6 +220,38 @@ def check_login():
 # ====================================================================
 class BackendError(RuntimeError):
     pass
+
+
+BRIDGE_AGENT_NAME = "bridge"
+BRIDGE_OC_CONFIG = {
+    "websearch": False,
+    "permission": {"websearch": "deny", "bash": "deny"},
+    "agent": {
+        BRIDGE_AGENT_NAME: {
+            "description": "OCBridge text-only bridge agent",
+            "mode": "primary",
+            "system": (
+                "You are a pure text assistant inside a bridge service. "
+                "You have NO web search and NO command execution. "
+                "Answer directly in plain text. If the user message specifies "
+                "an output format (e.g. a JSON envelope), follow it exactly."
+            ),
+        }
+    },
+}
+
+
+def ensure_bridge_oc_config():
+    """确保注入给 opencode 后端的配置文件存在且为最新; 返回路径。
+    关键作用: 关闭 websearch(该工具在本场景下会永久挂起) 并禁用 bash。"""
+    path = APP_DIR / "opencode_bridge.json"
+    content = json.dumps(BRIDGE_OC_CONFIG, ensure_ascii=False, indent=2)
+    try:
+        if not path.exists() or path.read_text(encoding="utf-8") != content:
+            path.write_text(content, encoding="utf-8")
+    except Exception as e:
+        log(f"[警告] 写入 opencode 配置失败: {e}")
+    return str(path)
 
 
 class BackendManager:
@@ -368,6 +400,7 @@ class BackendManager:
         # 防止 opencode 加载工作目录里的指令文件(AGENTS.md/CLAUDE.md 等)污染桥的推理上下文;
         # 上游客户端(WorkBuddy)自己管理上下文, 桥只做纯推理中转。
         env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "true"
+        env["OPENCODE_CONFIG"] = ensure_bridge_oc_config()
         env["OPENCODE_DISABLE_CLAUDE_CODE"] = "true"
         env["OPENCODE_DISABLE_AUTOUPDATE"] = "true"
         logf = open(SERVE_LOG, "ab")
@@ -452,6 +485,7 @@ class BackendManager:
 
     def wait_reply(self, sid, since_ms, max_wait=None, poll=1.0):
         deadline = time.time() + (max_wait or self.cfg.get("request_timeout", 300))
+        stall_since = None      # 检测"工具卡死": running 状态的工具持续过久
         while time.time() < deadline:
             msgs = self.messages(sid)
             asst, idle = None, None
@@ -466,6 +500,18 @@ class BackendManager:
                 done = asst.get("time", {}).get("completed") is not None
                 if text and (done or idle):
                     return text, {"tokens": asst.get("tokens"), "cost": asst.get("cost")}
+                # 卡死工具检测: 长时间 running 的工具(如需要客户端参与但无人执行的工具)
+                has_running_tool = any(
+                    p.get("type") == "tool" and (p.get("state") or {}).get("status") == "running"
+                    for p in asst.get("content", [])
+                )
+                if has_running_tool:
+                    if stall_since is None:
+                        stall_since = time.time()
+                    elif time.time() - stall_since >= 30:
+                        raise BackendError("引擎工具执行卡住(30秒无进展), 中断并重试")
+                else:
+                    stall_since = None
             if idle is not None and idle.get("outcome") == "failed":
                 err = idle.get("error") or {}
                 raise BackendError(f"模型调用失败: {err.get('message') or err.get('type') or idle.get('outcome')}")
@@ -1063,7 +1109,7 @@ class Handler(BaseHTTPRequestHandler):
             backend.ensure()
 
             t0 = time.time()
-            for _attempt in (1, 2):
+            for _attempt in (1, 2, 3):
                 prefix_key = SessionCache.key(messages[:-1]) if (len(messages) > 1 and _attempt == 1) else None
                 sid = cache.get(prefix_key) if prefix_key else None
                 incremental = sid is not None
@@ -1100,7 +1146,7 @@ class Handler(BaseHTTPRequestHandler):
                         busy.discard(sid)
                     except Exception:
                         pass
-                    if _attempt == 2:
+                    if _attempt == 3:
                         raise
                     # 后端可能处于"退出中/半死"状态: 清理重建, 重试一次
                     log(f"chat 首次尝试失败({type(e).__name__}: {str(e)[:140]}), 重建后端并重试...")
