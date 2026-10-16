@@ -30,6 +30,7 @@ import atexit
 import base64
 import hashlib
 import json
+import lzma
 import os
 import platform
 import re
@@ -98,8 +99,33 @@ DEFAULT_CONFIG = {
 }
 
 
-def find_opencode_cli(cfg=None):
-    """自动探测本机 opencode 可执行文件。返回路径字符串或 None。"""
+def materialize_engine():
+    """若内置引擎以 .xz 压缩存放, 首次使用时自动解压 (幂等; 检查开销极小)。
+    用于"分发包瘦身": 下载包内引擎为压缩态, 首次运行解压一次。"""
+    eng_dir = APP_DIR / "opencode"
+    for name in ("opencode.exe", "opencode"):
+        xz = eng_dir / (name + ".xz")
+        exe = eng_dir / name
+        try:
+            if xz.exists() and not exe.exists():
+                print(f"[首次使用] 正在解压内置引擎 ({xz.stat().st_size // 1048576} MB -> 约 200 MB, 请稍候)...", flush=True)
+                t0 = time.time()
+                with lzma.open(xz, "rb") as fi, open(exe, "wb") as fo:
+                    shutil.copyfileobj(fi, fo, 8 * 1024 * 1024)
+                if os.name != "nt":
+                    os.chmod(exe, 0o755)
+                print(f"[完成] 引擎已就绪 (耗时 {time.time() - t0:.0f} 秒)", flush=True)
+                return str(exe)
+        except Exception as e:
+            print(f"[警告] 解压内置引擎失败: {e}", flush=True)
+    return None
+
+
+def find_opencode_cli(cfg=None, allow_extract=True):
+    """自动探测本机 opencode 可执行文件。返回路径字符串或 None。
+    allow_extract=False 时不会触发内置引擎的首次解压 (供 UI 状态刷新使用)。"""
+    if allow_extract:
+        materialize_engine()
     candidates = []
     if cfg:
         p = (cfg.get("backend") or {}).get("cli_path")
@@ -1121,8 +1147,13 @@ def cmd_status(cfg):
     print("=" * 62)
     ok, msg = check_login()
     print(f" 登录状态   : {'OK' if ok else '未登录!'} — {msg}")
-    cli = find_opencode_cli(cfg)
-    print(f" opencode   : {cli if cli else '未找到 (运行 setup --download 自动下载)'}")
+    cli = find_opencode_cli(cfg, allow_extract=False)
+    if cli:
+        print(f" opencode   : {cli}")
+    elif (APP_DIR / "opencode" / "opencode.exe.xz").exists():
+        print(" opencode   : 内置引擎(压缩存放) — 首次启动服务/同步时自动解压一次")
+    else:
+        print(" opencode   : 未找到 (运行 setup --download 自动下载)")
     backend = BackendManager(cfg)
     try:
         ready = backend.health()
