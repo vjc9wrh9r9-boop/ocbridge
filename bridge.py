@@ -483,8 +483,11 @@ class BackendManager:
         code, data = self.api("POST", "/api/session", body)
         return data["data"]["id"]
 
-    def send_prompt(self, sid, text):
-        self.api("POST", f"/api/session/{sid}/prompt", {"text": text})
+    def send_prompt(self, sid, text, files=None):
+        body = {"text": text}
+        if files:
+            body["files"] = [{"uri": u, "name": n} for (u, n) in files]
+        self.api("POST", f"/api/session/{sid}/prompt", body)
 
     def messages(self, sid):
         code, data = self.api("GET", f"/api/session/{sid}/message")
@@ -735,6 +738,65 @@ ENVELOPE_PROMPT = """【工具调用协议】
 # ====================================================================
 # 请求构建 (OpenAI messages -> opencode prompt)
 # ====================================================================
+IMG_TMP_DIR = APP_DIR / "img_cache"
+
+
+def extract_images(messages):
+    """提取"本轮"（最后一条 user 消息）附带的图片: data URL 落盘为临时文件, http URL 原样传递。
+    返回 [(uri, name)]，最多 4 张。"""
+    last_user = None
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            last_user = m
+            break
+    if last_user is None or not isinstance(last_user.get("content"), list):
+        return []
+    try:
+        IMG_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return []
+    try:
+        cutoff = time.time() - 3600
+        for f in IMG_TMP_DIR.glob("*"):
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink(missing_ok=True)
+    except Exception:
+        pass
+    result = []
+    for part in last_user["content"]:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") not in ("image_url", "input_image"):
+            continue
+        iu = part.get("image_url")
+        url = iu.get("url") if isinstance(iu, dict) else iu
+        if not isinstance(url, str) or not url:
+            continue
+        if url.startswith("data:"):
+            try:
+                header, b64 = url.split(",", 1)
+                ext = "png"
+                for k, v in (("jpeg", "jpg"), ("jpg", "jpg"), ("webp", "webp"), ("gif", "gif")):
+                    if k in header.lower():
+                        ext = v
+                        break
+                raw = base64.b64decode(b64)
+                if len(raw) > 20 * 1024 * 1024:
+                    log("[警告] 图片超过 20MB, 已跳过")
+                    continue
+                fname = f"img_{uuid.uuid4().hex[:10]}.{ext}"
+                fpath = IMG_TMP_DIR / fname
+                fpath.write_bytes(raw)
+                result.append((fpath.as_uri(), fname))
+            except Exception as e:
+                log(f"[警告] 图片解析失败: {e}")
+        elif url.startswith(("http://", "https://")):
+            result.append((url, "image"))
+        if len(result) >= 4:
+            break
+    return result
+
+
 def content_to_text(content):
     if content is None:
         return ""
@@ -747,7 +809,7 @@ def content_to_text(content):
                 if p.get("type") == "text":
                     parts.append(p.get("text", ""))
                 elif p.get("type") in ("image_url", "input_image"):
-                    parts.append("[图片附件: 本桥暂不支持图像输入]")
+                    parts.append("[图片]")
             elif isinstance(p, str):
                 parts.append(p)
         return "\n".join(parts)
@@ -986,7 +1048,7 @@ def make_entry(m, cfg):
         "url": bridge_url,
         "apiKey": cfg.get("api_key") or "ocbridge",
         "supportsToolCall": supports_tools,
-        "supportsImages": False,
+        "supportsImages": bool(m.get("images")),
         "useCustomProtocol": False,
         OWNER_FIELD: OWNER,
     }
@@ -1114,6 +1176,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             backend.ensure()
 
+            images = extract_images(messages)
             t0 = time.time()
             for _attempt in (1, 2, 3):
                 prefix_key = SessionCache.key(messages[:-1]) if (len(messages) > 1 and _attempt == 1) else None
@@ -1128,9 +1191,11 @@ class Handler(BaseHTTPRequestHandler):
                         prompt = build_prompt(messages, tools, cfg.get("tool_envelope", True))
                     else:
                         prompt = build_incremental(messages)
+                    if images:
+                        prompt += f"\n\n[用户在本轮消息中附带了 {len(images)} 张图片, 已作为附件提供, 请结合图片内容回答]"
                     since_ms = int(time.time() * 1000) - 1500
                     try:
-                        backend.send_prompt(sid, prompt)
+                        backend.send_prompt(sid, prompt, files=images)
                         text, meta = backend.wait_reply(sid, since_ms)
                     except Exception:
                         if incremental:
@@ -1140,8 +1205,10 @@ class Handler(BaseHTTPRequestHandler):
                             sid = backend.create_session(oc_model, title="bridge")
                             busy.add(sid)
                             prompt = build_prompt(messages, tools, cfg.get("tool_envelope", True))
+                            if images:
+                                prompt += f"\n\n[用户在本轮消息中附带了 {len(images)} 张图片, 已作为附件提供, 请结合图片内容回答]"
                             since_ms = int(time.time() * 1000) - 1500
-                            backend.send_prompt(sid, prompt)
+                            backend.send_prompt(sid, prompt, files=images)
                             text, meta = backend.wait_reply(sid, since_ms)
                         else:
                             raise
