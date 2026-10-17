@@ -231,9 +231,23 @@ class BackendError(RuntimeError):
 
 
 BRIDGE_AGENT_NAME = "bridge"
+# 关闭"深度思考"(reasoning) 的免费模型列表; 思考会大幅拖慢响应(实测 GLM 大输入 43s->5.7s)
+NON_THINK_MODELS = [
+    "nemotron-3.5-super-vl-free", "beam-free", "longcat-2.5-preview-free",
+    "space-bunny-free", "mimo-v2.6-flash-free", "deepseek-v4.1-flash-free",
+    "glm-5.3-flash-free", "nemotron-3.5-lightning-free", "nemotron-3-ultra-free", "big-pickle",
+]
 BRIDGE_OC_CONFIG = {
     "websearch": False,
     "permission": {"websearch": "deny", "bash": "deny"},
+    "provider": {
+        "opencode": {
+            "models": {
+                m: {"options": {"reasoning": {"enabled": False}}}
+                for m in NON_THINK_MODELS
+            }
+        }
+    },
     "agent": {
         BRIDGE_AGENT_NAME: {
             "description": "OCBridge text-only bridge agent",
