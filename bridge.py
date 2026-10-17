@@ -189,7 +189,14 @@ def models_file_path(cfg):
 
 
 def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    # 双通道: 同时直写日志文件 (不依赖启动方式的 stdout 重定向)
+    try:
+        with open(SERVE_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
 
 
 # ====================================================================
@@ -483,7 +490,7 @@ class BackendManager:
         code, data = self.api("GET", f"/api/session/{sid}/message")
         return data.get("data", [])
 
-    def wait_reply(self, sid, since_ms, max_wait=None, poll=1.0):
+    def wait_reply(self, sid, since_ms, max_wait=None, poll=0.5):
         deadline = time.time() + (max_wait or self.cfg.get("request_timeout", 300))
         stall_since = None      # 检测"工具卡死": running 状态的工具持续过久
         while time.time() < deadline:
@@ -1003,8 +1010,7 @@ class Handler(BaseHTTPRequestHandler):
     busy = None
 
     def log_message(self, fmt, *args):
-        sys.stdout.write(f"[{time.strftime('%H:%M:%S')}] {fmt % args}\n")
-        sys.stdout.flush()
+        log(fmt % args)
 
     # ---------- helpers ----------
     def _json(self, code, obj):
