@@ -397,12 +397,35 @@ class BridgeGUI:
                 service_args(), stdout=logf, stderr=subprocess.STDOUT,
                 cwd=str(APP_DIR), creationflags=no_window_flags())
             if first_time:
-                self.log(f"服务已启动 (pid={self.svc_proc.pid}) — 首次使用正在解压内置引擎, 约 10-20 秒后可用...")
+                self.log(f"服务进程已创建 (pid={self.svc_proc.pid}) — 首次使用正在解压内置引擎, 请稍候...")
+                self._wait_service_ready(40)
             else:
-                self.log(f"服务已启动 (pid={self.svc_proc.pid}), 等待就绪...")
-            self.root.after(2500, self.refresh)
+                self.log(f"服务进程已创建 (pid={self.svc_proc.pid}), 等待服务就绪...")
+                self._wait_service_ready(25)
         except Exception as e:
-            self.log(f"启动失败: {e}")
+            self.log(f"❌ 启动失败: {e}")
+
+    def _wait_service_ready(self, remain):
+        """轮询等待桥服务就绪, 并在日志中明确反馈成功/失败。"""
+        def check(n):
+            try:
+                if self.svc_proc and self.svc_proc.poll() is not None:
+                    self.log(f"❌ 服务进程已退出 (exit={self.svc_proc.returncode}) — 请查看 opencode_serve.log")
+                    self.refresh()
+                    return
+                ok, _ = self._health(timeout=2)
+                if ok:
+                    self.log(f"✅ 服务已就绪 (127.0.0.1:{BRIDGE_PORT}) — 可以开始使用 (引擎将在首次请求时自动启动)")
+                    self.refresh()
+                    return
+                if n <= 0:
+                    self.log("❌ 服务启动超时 — 请查看 opencode_serve.log 排查")
+                    self.refresh()
+                    return
+            except Exception:
+                pass
+            self.root.after(1000, check, n - 1)
+        check(remain)
 
     def _find_pids_by_port(self, port):
         """按端口查找正在监听的进程 PID 列表 (兼容中文系统 GBK 输出)。"""
