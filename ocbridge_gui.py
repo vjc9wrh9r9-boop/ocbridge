@@ -299,8 +299,7 @@ class BridgeGUI:
             self.lb_service.configure(text=f"桥服务:  ● 运行中  (127.0.0.1:{BRIDGE_PORT})",
                                       foreground="#0a7d32")
             self.btn_start.configure(state="disabled")
-            self.btn_stop.configure(
-                state="normal" if (self.svc_proc and self.svc_proc.poll() is None) else "disabled")
+            self.btn_stop.configure(state="normal")
         else:
             self.lb_service.configure(text="桥服务:  ○ 未运行", foreground="#b03030")
             self.btn_start.configure(state="normal")
@@ -361,8 +360,7 @@ class BridgeGUI:
                 self.lb_service.configure(text=f"桥服务:  ● 运行中  (127.0.0.1:{BRIDGE_PORT})",
                                           foreground="#0a7d32")
                 self.btn_start.configure(state="disabled")
-                if self.svc_proc and self.svc_proc.poll() is None:
-                    self.btn_stop.configure(state="normal")
+                self.btn_stop.configure(state="normal")
             else:
                 self.lb_service.configure(text="桥服务:  ○ 未运行", foreground="#b03030")
                 self.btn_start.configure(state="normal")
@@ -406,8 +404,29 @@ class BridgeGUI:
         except Exception as e:
             self.log(f"启动失败: {e}")
 
+    def _find_pids_by_port(self, port):
+        """按端口查找正在监听的进程 PID 列表 (兼容中文系统 GBK 输出)。"""
+        import subprocess
+        pids = []
+        try:
+            raw = subprocess.run(["netstat", "-ano"], capture_output=True,
+                                 creationflags=no_window_flags(), timeout=10).stdout
+            out = raw.decode("gbk", "replace") if raw else ""
+            for line in out.splitlines():
+                if f":{port}" in line and "LISTENING" in line.upper():
+                    parts = line.split()
+                    pid = parts[-1] if parts else ""
+                    if pid.isdigit():
+                        pids.append(int(pid))
+        except Exception:
+            pass
+        return pids
+
     def stop_service(self):
         from tkinter import messagebox
+        import subprocess
+        stopped = False
+        # 1) 本界面启动的进程 -> 优雅终止
         if self.svc_proc and self.svc_proc.poll() is None:
             self.svc_proc.terminate()
             try:
@@ -415,11 +434,29 @@ class BridgeGUI:
             except Exception:
                 self.svc_proc.kill()
             self.svc_proc = None
-            self.log("服务已停止 (opencode 后端会空闲 5 分钟后自动退出)")
-            self.root.after(800, self.refresh)
+            stopped = True
+            self.log("服务已停止 (opencode 后端会空闲后自动退出)")
         else:
-            self.log("当前没有由本界面启动的服务进程")
-            messagebox.showinfo("提示", "没有可停止的服务。\n如果服务由其他方式启动, 请关闭对应窗口/进程。")
+            # 2) 外部启动的进程: 按端口查找并终止 (桥 + 引擎后端)
+            ports = [BRIDGE_PORT, int(CFG["backend"]["port"])]
+            pids = []
+            for port in ports:
+                pids.extend(self._find_pids_by_port(port))
+            pids = [p for p in dict.fromkeys(pids) if p != os.getpid()]
+            if pids:
+                for pid in pids:
+                    try:
+                        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                                       capture_output=True, creationflags=no_window_flags(), timeout=10)
+                    except Exception as e:
+                        self.log(f"[警告] 终止进程 {pid} 失败: {e}")
+                stopped = True
+                self.log(f"服务已停止 (桥 + 引擎后端, pid={', '.join(map(str, pids))})")
+            else:
+                self.log("当前未发现运行中的桥服务")
+                messagebox.showinfo("提示", "没有发现正在运行的桥服务。")
+        if stopped:
+            self.root.after(800, self.refresh)
 
     # -------------------------------------------------- 同步 / 下载
     def _run_cli_stream(self, subcmd, tag):
