@@ -91,7 +91,8 @@ DEFAULT_CONFIG = {
         "start_timeout": 45,
     },
     "agent": "bridge",
-    "request_timeout": 180,
+    "request_timeout": 150,
+    "first_response_timeout": 90,
     "session_cache_size": 100,
     "tool_envelope": True,
     "probe": {"timeout": 20, "cache_ttl": 21600},
@@ -494,7 +495,9 @@ class BackendManager:
         return data.get("data", [])
 
     def wait_reply(self, sid, since_ms, max_wait=None, poll=0.5):
-        deadline = time.time() + (max_wait or self.cfg.get("request_timeout", 300))
+        deadline = time.time() + (max_wait or self.cfg.get("request_timeout", 150))
+        first_timeout = int(self.cfg.get("first_response_timeout", 90))
+        first_deadline = time.time() + first_timeout
         stall_since = None      # 检测"工具卡死": running 状态的工具持续过久
         while time.time() < deadline:
             msgs = self.messages(sid)
@@ -506,6 +509,7 @@ class BackendManager:
                 if m.get("type") == "idle" and t.get("created", 0) >= since_ms:
                     idle = m
             if asst is not None:
+                first_deadline = 0      # 已有响应, 取消首响应计时
                 text = "".join(p.get("text", "") for p in asst.get("content", []) if p.get("type") == "text")
                 done = asst.get("time", {}).get("completed") is not None
                 if text and (done or idle):
@@ -522,6 +526,10 @@ class BackendManager:
                         raise BackendError("引擎工具执行卡住(30秒无进展), 中断并重试")
                 else:
                     stall_since = None
+            elif first_deadline and time.time() > first_deadline:
+                # 首响应超时: 模型长时间无任何输出 -> 快速失败, 不让用户干等
+                raise BackendError(
+                    f"模型首次响应超时(>{first_timeout}秒无输出), 该模型可能繁忙或思考过久, 建议换用其他模型")
             if idle is not None and idle.get("outcome") == "failed":
                 err = idle.get("error") or {}
                 raise BackendError(f"模型调用失败: {err.get('message') or err.get('type') or idle.get('outcome')}")
@@ -1219,6 +1227,10 @@ class Handler(BaseHTTPRequestHandler):
                         busy.discard(sid)
                     except Exception:
                         pass
+                    err_msg = str(e)
+                    # 模型慢/超时类错误: 重试只会让用户等更久 (模型只是在慢慢思考), 立即失败并提示换模型
+                    if "首次响应超时" in err_msg or "等待模型回复超时" in err_msg:
+                        raise
                     if _attempt == 3:
                         raise
                     # 后端可能处于"退出中/半死"状态: 清理重建, 重试一次
